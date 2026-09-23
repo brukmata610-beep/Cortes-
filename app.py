@@ -1,152 +1,429 @@
-import os, uuid, json, threading, subprocess, math, re
+import os
+import uuid
+import json
+import threading
+import subprocess
+import re
 from pathlib import Path
+
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from openai import OpenAI
 
-BASE=Path(__file__).resolve().parent
-JOBS=BASE/"jobs"; JOBS.mkdir(exist_ok=True)
-app=Flask(__name__)
 
-def save(job,state):
-    (JOBS/job/"state.json").write_text(json.dumps(state,ensure_ascii=False),encoding="utf-8")
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
 
-def cmd(c):
-    print("EXECUTANDO:", " ".join(map(str, c)), flush=True)
+BASE = Path(__file__).resolve().parent
+JOBS = BASE / "jobs"
+JOBS.mkdir(parents=True, exist_ok=True)
 
-    result = subprocess.run(
-        c,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True
+app = Flask(__name__)
+
+
+# ============================================================
+# UTILIDADES
+# ============================================================
+
+def save(job, state):
+    job.mkdir(parents=True, exist_ok=True)
+
+    temp = job / "state.tmp"
+    target = job / "state.json"
+
+    temp.write_text(
+        json.dumps(state, ensure_ascii=False),
+        encoding="utf-8"
     )
 
-    print(result.stdout, flush=True)
+    temp.replace(target)
+
+
+def cmd(command):
+    """
+    Executa um comando externo e mostra o resultado completo
+    nos logs do Render.
+    """
+
+    command = [str(x) for x in command]
+
+    print(
+        "\n==================================================",
+        flush=True
+    )
+    print(
+        "EXECUTANDO:",
+        " ".join(command),
+        flush=True
+    )
+    print(
+        "==================================================",
+        flush=True
+    )
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace"
+    )
+
+    output = result.stdout or ""
+
+    print(output, flush=True)
 
     if result.returncode != 0:
         raise RuntimeError(
             "Comando falhou (exit %s):\n%s"
-            % (result.returncode, result.stdout[-8000:])
+            % (
+                result.returncode,
+                output[-12000:]
+            )
         )
 
-    return result.stdout
+    return output
 
-def transcribe(client,audio):
-    with open(audio,"rb") as f:
-        r=client.audio.transcriptions.create(
-            model=os.getenv("TRANSCRIBE_MODEL","gpt-4o-mini-transcribe"),
+
+def clean_json_text(text):
+    """
+    Remove possíveis blocos ```json ... ``` retornados pela IA.
+    """
+
+    text = (text or "").strip()
+
+    if text.startswith("```"):
+        text = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            text,
+            flags=re.IGNORECASE
+        )
+
+        text = re.sub(
+            r"\s*```$",
+            "",
+            text
+        )
+
+    return text.strip()
+
+
+def clamp_number(value, minimum, maximum, default):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = default
+
+    return max(minimum, min(value, maximum))
+
+
+# ============================================================
+# TRANSCRIÇÃO
+# ============================================================
+
+def transcribe(client, audio):
+    print("Iniciando transcrição...", flush=True)
+
+    with open(audio, "rb") as f:
+        response = client.audio.transcriptions.create(
+            model=os.getenv(
+                "TRANSCRIBE_MODEL",
+                "gpt-4o-mini-transcribe"
+            ),
             file=f,
             response_format="verbose_json",
             timestamp_granularities=["segment"]
         )
-    return [{"start":s.start,"end":s.end,"text":s.text.strip()} for s in r.segments]
 
-def choose_moments(client,segments,count,duration):
-    transcript="\n".join(f"[{x['start']:.1f}-{x['end']:.1f}] {x['text']}" for x in segments)
-    prompt=f"""Você é editor de cortes virais para Shorts/Reels/TikTok.
-Analise a transcrição abaixo e escolha até {count} trechos fortes.
-Cada trecho deve ter entre 30 e {duration} segundos, começar e terminar em pontos naturais,
-e priorizar: gancho forte, opinião polêmica sem inventar fatos, história, surpresa,
-dica prática, pergunta/resposta ou momento engraçado.
-Retorne SOMENTE JSON no formato:
-{{"clips":[{{"start":0,"end":60,"title":"...","hook":"..."}}]}}
-Não invente falas. Use apenas timestamps da transcrição.
+    segments = []
+
+    for segment in getattr(response, "segments", []) or []:
+        start = float(getattr(segment, "start", 0) or 0)
+        end = float(getattr(segment, "end", 0) or 0)
+        text = str(getattr(segment, "text", "") or "").strip()
+
+        if not text:
+            continue
+
+        if end <= start:
+            continue
+
+        segments.append({
+            "start": start,
+            "end": end,
+            "text": text
+        })
+
+    if not segments:
+        raise RuntimeError(
+            "A transcrição não retornou segmentos com timestamps."
+        )
+
+    print(
+        f"Transcrição concluída: {len(segments)} segmentos.",
+        flush=True
+    )
+
+    return segments
+
+
+# ============================================================
+# ESCOLHA DOS MELHORES MOMENTOS
+# ============================================================
+
+def choose_moments(client, segments, count, duration):
+
+    transcript = "\n".join(
+        f"[{x['start']:.1f}-{x['end']:.1f}] {x['text']}"
+        for x in segments
+    )
+
+    # Evita mandar uma quantidade gigantesca de texto para a API.
+    transcript = transcript[:180000]
+
+    prompt = f"""
+Você é um editor profissional de vídeos curtos para
+YouTube Shorts, Instagram Reels e TikTok.
+
+Analise a transcrição abaixo e escolha até {count} dos
+melhores momentos.
+
+REGRAS:
+
+- Cada corte deve ter entre 30 e {duration} segundos.
+- Não invente nenhuma fala.
+- Use somente trechos existentes na transcrição.
+- O início e o final devem ser naturais.
+- Priorize:
+  - gancho forte;
+  - opinião interessante;
+  - história;
+  - surpresa;
+  - pergunta e resposta;
+  - momento engraçado;
+  - informação útil;
+  - discussão;
+  - frase que desperte curiosidade.
+- Evite trechos sem contexto.
+- Evite silêncio.
+- Evite escolher várias partes praticamente iguais.
+- Os timestamps precisam estar dentro da transcrição.
+
+RETORNE SOMENTE JSON VÁLIDO.
+
+Formato obrigatório:
+
+{{
+  "clips": [
+    {{
+      "start": 100.0,
+      "end": 155.0,
+      "title": "Título curto do corte",
+      "hook": "Gancho curto para apresentar o corte"
+    }}
+  ]
+}}
+
 TRANSCRIÇÃO:
-{transcript[:180000]}"""
-    r=client.responses.create(
-        model=os.getenv("ANALYSIS_MODEL","gpt-5.6-luna"),
+
+{transcript}
+"""
+
+    model = os.getenv(
+        "ANALYSIS_MODEL",
+        "gpt-5.6"
+    )
+
+    print(
+        f"Analisando transcrição com modelo: {model}",
+        flush=True
+    )
+
+    response = client.responses.create(
+        model=model,
         input=prompt
     )
-    text=r.output_text
-    m=re.search(r'\{.*\}',text,re.S)
-    if not m: raise ValueError("A IA não retornou JSON válido.")
-    data=json.loads(m.group(0))
-    return data.get("clips",[])[:count]
 
-def make_srt(segments,start,end,path):
-    rows=[]; n=1
-    for s in segments:
-        a=max(s["start"],start); b=min(s["end"],end)
-        if b<=a: continue
-        def ts(v):
-            ms=int((v-int(v))*1000); sec=int(v); h=sec//3600; sec%=3600; mi=sec//60; sec%=60
-            return f"{h:02d}:{mi:02d}:{sec:02d},{ms:03d}"
-        rows.append(f"{n}\n{ts(a-start)} --> {ts(b-start)}\n{s['text']}\n")
-        n+=1
-    path.write_text("\n".join(rows),encoding="utf-8")
+    text = clean_json_text(
+        getattr(response, "output_text", "")
+    )
 
-def worker(jobid,url,count,duration):
-    job=JOBS/jobid; job.mkdir(exist_ok=True)
-    state={"status":"iniciando","progress":1,"message":"Preparando IA...","clips":[]}
-    save(job,state)
+    if not text:
+        raise RuntimeError(
+            "A IA não retornou nenhum resultado."
+        )
+
+    # Procura o primeiro objeto JSON.
+    match = re.search(
+        r"\{.*\}",
+        text,
+        flags=re.DOTALL
+    )
+
+    if not match:
+        raise RuntimeError(
+            "A IA não retornou JSON válido.\n"
+            + text[:4000]
+        )
+
     try:
-        key=os.getenv("OPENAI_API_KEY")
-        if not key: raise RuntimeError("Defina OPENAI_API_KEY no servidor.")
-        client=OpenAI(api_key=key)
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            "Não foi possível interpretar o JSON da IA: "
+            + str(e)
+        )
 
-        video=job/"source.mp4"
-        cmd(["yt-dlp","--no-playlist","-f","bv*[height<=720]+ba/b[height<=720]",
-             "--merge-output-format","mp4","-o",str(video),url])
-        state.update(status="audio",progress=20,message="Extraindo áudio para transcrição...")
-        save(job,state)
+    clips = data.get("clips", [])
 
-        audio=job/"audio.mp3"
-        cmd(["ffmpeg","-y","-i",str(video),"-vn","-ac","1","-ar","16000","-b:a","64k",str(audio)])
-        state.update(status="transcricao",progress=35,message="Transcrevendo a live com IA...")
-        save(job,state)
-        segments=transcribe(client,audio)
-        (job/"transcript.json").write_text(json.dumps(segments,ensure_ascii=False),encoding="utf-8")
+    if not isinstance(clips, list):
+        raise RuntimeError(
+            "A IA retornou um formato de clips inválido."
+        )
 
-        state.update(status="selecao",progress=55,message="IA escolhendo os melhores momentos...")
-        save(job,state)
-        clips=choose_moments(client,segments,count,duration)
+    valid_clips = []
 
-        state.update(status="render",progress=65,message="Renderizando cortes e legendas...")
-        save(job,state)
-        outclips=[]
-        for i,c in enumerate(clips,1):
-            start=max(0,float(c["start"])); end=min(start+duration,float(c["end"]))
-            if end-start<15: continue
-            srt=job/f"clip_{i:02d}.srt"; out=job/f"corte_{i:02d}.mp4"
-            make_srt(segments,start,end,srt)
-            vf=("scale=1080:1920:force_original_aspect_ratio=increase,"
-                "crop=1080:1920,setsar=1,"
-                "subtitles="+str(srt).replace("\\","/")+":force_style="
-                "'FontName=Arial,FontSize=18,PrimaryColour=&H00FFFFFF,"
-                "OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1,"
-                "Alignment=2,MarginV=100'")
-            cmd(["ffmpeg","-y","-ss",str(start),"-i",str(video),"-t",str(end-start),
-                 "-vf",vf,"-c:v","libx264","-preset","veryfast","-crf","23",
-                 "-c:a","aac","-b:a","128k",str(out)])
-            outclips.append({"file":f"/download/{jobid}/{out.name}",
-                             "title":c.get("title","Corte"),"hook":c.get("hook","")})
-            state["progress"]=65+int(35*i/max(1,len(clips)))
-            state["clips"]=outclips; save(job,state)
+    video_duration = 0
 
-        state.update(status="concluido",progress=100,message="Tudo pronto!",clips=outclips)
-        save(job,state)
-    except Exception as e:
-        state.update(status="erro",progress=100,message=str(e)); save(job,state)
+    if segments:
+        video_duration = max(
+            float(s["end"])
+            for s in segments
+        )
 
-@app.get("/")
-def home(): return render_template("index.html")
+    for clip in clips:
 
-@app.post("/api/start")
-def start():
-    d=request.get_json(force=True); url=(d.get("url") or "").strip()
-    if not url: return jsonify(error="Cole um link do YouTube."),400
-    count=max(1,min(int(d.get("count",5)),15)); duration=max(30,min(int(d.get("duration",60)),120))
-    job=uuid.uuid4().hex[:12]
-    threading.Thread(target=worker,args=(job,url,count,duration),daemon=True).start()
-    return jsonify(job_id=job)
+        try:
+            start = float(clip["start"])
+            end = float(clip["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
 
-@app.get("/api/status/<job>")
-def status(job):
-    p=JOBS/job/"state.json"
-    if not p.exists(): return jsonify(error="Job não encontrado"),404
-    return jsonify(json.loads(p.read_text(encoding="utf-8")))
+        if start < 0:
+            start = 0
 
-@app.get("/download/<job>/<filename>")
-def download(job,filename): return send_from_directory(JOBS/job,filename,as_attachment=True)
+        if end <= start:
+            continue
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0",port=int(os.getenv("PORT",5000)))
+        if video_duration > 0:
+            start = min(start, video_duration)
+            end = min(end, video_duration)
+
+        length = end - start
+
+        if length < 30:
+            continue
+
+        if length > duration:
+            end = start + duration
+
+        if end <= start:
+            continue
+
+        valid_clips.append({
+            "start": start,
+            "end": end,
+            "title": str(
+                clip.get("title") or "Corte"
+            )[:150],
+            "hook": str(
+                clip.get("hook") or ""
+            )[:300]
+        })
+
+        if len(valid_clips) >= count:
+            break
+
+    if not valid_clips:
+        raise RuntimeError(
+            "A IA não encontrou cortes válidos "
+            "dentro dos limites solicitados."
+        )
+
+    print(
+        f"Cortes selecionados: {len(valid_clips)}",
+        flush=True
+    )
+
+    return valid_clips
+
+
+# ============================================================
+# SRT / LEGENDAS
+# ============================================================
+
+def make_srt(segments, start, end, path):
+
+    rows = []
+    number = 1
+
+    def timestamp(seconds):
+        seconds = max(0, float(seconds))
+
+        total_ms = int(round(seconds * 1000))
+
+        hours = total_ms // 3_600_000
+        total_ms %= 3_600_000
+
+        minutes = total_ms // 60_000
+        total_ms %= 60_000
+
+        secs = total_ms // 1000
+        milliseconds = total_ms % 1000
+
+        return (
+            f"{hours:02d}:"
+            f"{minutes:02d}:"
+            f"{secs:02d},"
+            f"{milliseconds:03d}"
+        )
+
+    for segment in segments:
+
+        seg_start = max(
+            float(segment["start"]),
+            start
+        )
+
+        seg_end = min(
+            float(segment["end"]),
+            end
+        )
+
+        if seg_end <= seg_start:
+            continue
+
+        text = str(
+            segment.get("text", "")
+        ).strip()
+
+        if not text:
+            continue
+
+        rows.append(
+            f"{number}\n"
+            f"{timestamp(seg_start - start)} --> "
+            f"{timestamp(seg_end - start)}\n"
+            f"{text}\n"
+        )
+
+        number += 1
+
+    path.write_text(
+        "\n".join(rows),
+        encoding="utf-8"
+    )
+
+
+# ============================================================
+# PROCESSAMENTO PRINCIPAL
+# ============================================================
+
+def worker(jobid, url, count, duration):
+
+    job = JOBS / jobid
+    job.mkdir(parents=True, exist_ok=True)
+
+    state =
