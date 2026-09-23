@@ -1,51 +1,30 @@
 FROM python:3.12-slim
 
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PORT=10000
+
 WORKDIR /app
 
-# Sistema + FFmpeg
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
         curl \
         ca-certificates \
-        unzip \
+        gcc \
     && rm -rf /var/lib/apt/lists/*
-
-# ============================================================
-# DENO
-# ============================================================
-
-ARG DENO_VERSION=2.8.0
-
-RUN curl -fL \
-    "https://github.com/denoland/deno/releases/download/v${DENO_VERSION}/deno-x86_64-unknown-linux-gnu.zip" \
-    -o /tmp/deno.zip \
-    && unzip /tmp/deno.zip -d /tmp/deno \
-    && install -m 0755 /tmp/deno/deno /usr/local/bin/deno \
-    && rm -rf /tmp/deno /tmp/deno.zip \
-    && deno --version
-
-# ============================================================
-# PYTHON
-# ============================================================
 
 COPY requirements.txt .
 
-RUN python -m pip install --no-cache-dir --upgrade pip \
-    && python -m pip install --no-cache-dir -r requirements.txt
-
-# ============================================================
-# APLICAÇÃO
-# ============================================================
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p /app/jobs
+RUN mkdir -p /app/work/jobs \
+    /app/work/outputs \
+    /app/work/uploads
 
-ENV PATH="/usr/local/bin:${PATH}"
+EXPOSE 10000
 
-# ============================================================
-# GUNICORN
-# ============================================================
-
-CMD ["gunicorn", "-w", "1", "--threads", "4", "--timeout", "7200", "-b", "0.0.0.0:10000", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:10000", "--workers", "1", "--threads", "4", "--timeout", "7200", "--access-logfile", "-", "--error-logfile", "-", "app:app"]
