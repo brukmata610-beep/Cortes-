@@ -11,7 +11,24 @@ def save(job,state):
     (JOBS/job/"state.json").write_text(json.dumps(state,ensure_ascii=False),encoding="utf-8")
 
 def cmd(c):
-    subprocess.run(c,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    print("EXECUTANDO:", " ".join(map(str, c)), flush=True)
+
+    result = subprocess.run(
+        c,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True
+    )
+
+    print(result.stdout, flush=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Comando falhou (exit %s):\n%s"
+            % (result.returncode, result.stdout[-8000:])
+        )
+
+    return result.stdout
 
 def transcribe(client,audio):
     with open(audio,"rb") as f:
