@@ -3,250 +3,476 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+
   <title>Cortes IA</title>
+
   <link rel="stylesheet" href="/static/style.css">
 </head>
 
 <body>
+
 <main>
+
   <div class="brand">✂️ CORTES IA</div>
 
   <h1>Live inteira → Cortes prontos</h1>
 
   <p class="sub">
-    A IA transcreve, encontra os melhores momentos, legenda e transforma em 9:16.
+    A IA transcreve a live, encontra os melhores momentos
+    e transforma tudo em vídeos verticais.
   </p>
+
 
   <section class="card">
 
-    <label>Link da live do YouTube</label>
+    <label for="url">
+      Link da live do YouTube
+    </label>
+
     <input
       id="url"
       type="url"
+      autocomplete="off"
       placeholder="Cole aqui o link da live..."
     >
+
 
     <div class="grid">
 
       <div>
-        <label>Quantidade de cortes</label>
+
+        <label for="count">
+          Quantidade de cortes
+        </label>
+
         <select id="count">
-          <option value="3">3</option>
-          <option value="5" selected>5</option>
-          <option value="10">10</option>
+
+          <option value="3">
+            3 cortes
+          </option>
+
+          <option value="5" selected>
+            5 cortes
+          </option>
+
+          <option value="10">
+            10 cortes
+          </option>
+
         </select>
+
       </div>
 
+
       <div>
-        <label>Duração máxima</label>
+
+        <label for="duration">
+          Duração máxima
+        </label>
+
         <select id="duration">
-          <option value="30">30s</option>
-          <option value="60" selected>60s</option>
-          <option value="90">90s</option>
+
+          <option value="30">
+            30 segundos
+          </option>
+
+          <option value="60" selected>
+            60 segundos
+          </option>
+
+          <option value="90">
+            90 segundos
+          </option>
+
         </select>
+
       </div>
 
     </div>
 
-    <button id="go" type="button">
+
+    <button
+      id="go"
+      type="button"
+    >
       🚀 GERAR CORTES COM IA
     </button>
 
-    <div id="status" class="hide">
+
+    <div
+      id="status"
+      class="hide"
+      aria-live="polite"
+    >
+
       <div class="bar">
         <i id="fill"></i>
       </div>
 
-      <b id="msg"></b>
+      <b id="msg">
+        Aguardando...
+      </b>
+
     </div>
+
 
     <div id="results"></div>
 
   </section>
 
+
   <small>
     Use somente conteúdo que você tenha autorização para baixar e editar.
   </small>
+
 </main>
 
+
 <script>
+
+"use strict";
+
+
 let timer = null;
-
-const urlInput = document.getElementById("url");
-const countInput = document.getElementById("count");
-const durationInput = document.getElementById("duration");
-const goButton = document.getElementById("go");
-
-const statusBox = document.getElementById("status");
-const fill = document.getElementById("fill");
-const msg = document.getElementById("msg");
-const results = document.getElementById("results");
+let polling = false;
 
 
-goButton.addEventListener("click", start);
+const urlInput =
+  document.getElementById("url");
+
+const countInput =
+  document.getElementById("count");
+
+const durationInput =
+  document.getElementById("duration");
+
+const goButton =
+  document.getElementById("go");
+
+const statusBox =
+  document.getElementById("status");
+
+const fill =
+  document.getElementById("fill");
+
+const msg =
+  document.getElementById("msg");
+
+const results =
+  document.getElementById("results");
+
+
+goButton.addEventListener(
+  "click",
+  start
+);
 
 
 async function start() {
 
-  const url = urlInput.value.trim();
-  const count = Number(countInput.value);
-  const duration = Number(durationInput.value);
-
-  if (!url) {
-    alert("Cole o link da live.");
+  if (polling) {
     return;
   }
 
+
+  const url =
+    urlInput.value.trim();
+
+  const clipCount =
+    Number(countInput.value);
+
+  const duration =
+    Number(durationInput.value);
+
+
+  if (!url) {
+
+    showError(
+      "Cole o link da live do YouTube."
+    );
+
+    urlInput.focus();
+
+    return;
+  }
+
+
+  if (!isValidYoutubeUrl(url)) {
+
+    showError(
+      "Digite um link válido do YouTube."
+    );
+
+    urlInput.focus();
+
+    return;
+  }
+
+
+  if (
+    !Number.isInteger(clipCount) ||
+    clipCount < 1
+  ) {
+
+    showError(
+      "Quantidade de cortes inválida."
+    );
+
+    return;
+  }
+
+
+  polling = true;
+
   goButton.disabled = true;
+
   statusBox.classList.remove("hide");
+
   results.innerHTML = "";
 
-  fill.style.width = "5%";
-  msg.textContent = "Iniciando processamento...";
+  fill.style.width = "3%";
+
+  msg.textContent =
+    "Iniciando processamento...";
+
+
+  stopTimer();
+
 
   try {
 
-    const response = await fetch("/api/start", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        url: url,
-        count: count,
-        duration: duration
-      })
-    });
+    const response =
+      await fetch(
+        "/api/start",
+        {
+          method: "POST",
 
-    const data = await response.json();
+          headers: {
+            "Content-Type":
+              "application/json"
+          },
+
+          body: JSON.stringify({
+            url: url,
+            clip_count: clipCount,
+            duration: duration
+          })
+        }
+      );
+
+
+    const data =
+      await readJson(response);
+
 
     if (!response.ok) {
-      throw new Error(data.error || "Erro ao iniciar o processamento.");
+
+      throw new Error(
+        data.error ||
+        data.message ||
+        "Não foi possível iniciar o processamento."
+      );
+
     }
+
 
     if (!data.job_id) {
-      throw new Error("O servidor não retornou o ID do processamento.");
+
+      throw new Error(
+        "O servidor não retornou o ID do processamento."
+      );
+
     }
 
-    timer = setInterval(() => {
-      poll(data.job_id);
-    }, 1500);
+
+    msg.textContent =
+      "Processamento iniciado...";
+
 
     await poll(data.job_id);
 
+
+    timer =
+      setInterval(
+        () => poll(data.job_id),
+        2000
+      );
+
+
   } catch (error) {
 
-    console.error(error);
+    console.error(
+      "Erro ao iniciar:",
+      error
+    );
 
-    msg.textContent = error.message;
-    goButton.disabled = false;
 
-    if (timer) {
-      clearInterval(timer);
-      timer = null;
-    }
+    showError(
+      error.message ||
+      "Erro ao iniciar o processamento."
+    );
+
+
+    finish();
+
+
   }
+
 }
 
 
 async function poll(id) {
 
+  if (!id || !polling) {
+    return;
+  }
+
+
   try {
 
-    const response = await fetch("/api/status/" + encodeURIComponent(id));
+    const response =
+      await fetch(
+        "/api/status/" +
+        encodeURIComponent(id),
+        {
+          cache: "no-store"
+        }
+      );
 
-    const data = await response.json();
+
+    const data =
+      await readJson(response);
+
 
     if (!response.ok) {
-      throw new Error(data.error || "Erro ao consultar processamento.");
+
+      throw new Error(
+        data.error ||
+        data.message ||
+        "Erro ao consultar o processamento."
+      );
+
     }
 
-    const progress = Number(data.progress || 0);
 
-    fill.style.width = Math.max(0, Math.min(100, progress)) + "%";
-
-    msg.textContent = data.message || "Processando...";
+    updateProgress(data);
 
 
-    if (data.status === "concluido") {
+    if (
+      data.status === "concluido" ||
+      data.status === "completed"
+    ) {
 
-      if (timer) {
-        clearInterval(timer);
-        timer = null;
-      }
+      finish();
 
-      fill.style.width = "100%";
-      msg.textContent = "Cortes prontos!";
+      fill.style.width =
+        "100%";
 
-      goButton.disabled = false;
+      msg.textContent =
+        "✅ Cortes prontos!";
 
-      if (Array.isArray(data.clips)) {
 
-        results.innerHTML = data.clips.map((clip, index) => {
+      renderResults(
+        data.clips
+      );
 
-          const title = clip.title || ("Corte " + (index + 1));
-          const hook = clip.hook || "";
-          const file = clip.file || "#";
-
-          return `
-            <article>
-              <h3>${escapeHtml(title)}</h3>
-
-              <p>${escapeHtml(hook)}</p>
-
-              <a href="${file}" download>
-                ⬇️ Baixar corte
-              </a>
-            </article>
-          `;
-
-        }).join("");
-      }
 
       return;
     }
 
 
-    if (data.status === "erro") {
+    if (
+      data.status === "erro" ||
+      data.status === "error" ||
+      data.status === "failed"
+    ) {
 
-      if (timer) {
-        clearInterval(timer);
-        timer = null;
-      }
+      finish();
 
-      goButton.disabled = false;
-
-      msg.textContent = data.message || "Ocorreu um erro.";
+      msg.textContent =
+        data.message ||
+        data.error ||
+        "Ocorreu um erro durante o processamento.";
 
       return;
     }
+
 
   } catch (error) {
 
-    console.error(error);
+    console.error(
+      "Erro no processamento:",
+      error
+    );
 
-    if (timer) {
-      clearInterval(timer);
-      timer = null;
-    }
+
+    stopTimer();
+
+
+    msg.textContent =
+      error.message ||
+      "Erro ao consultar o servidor.";
+
 
     goButton.disabled = false;
 
-    msg.textContent = error.message || "Erro ao consultar o servidor.";
+    polling = false;
+
   }
+
 }
 
 
-function escapeHtml(text) {
+function updateProgress(data) {
 
-  return String(text)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+  let progress =
+    Number(data.progress);
+
+
+  if (!Number.isFinite(progress)) {
+    progress = 0;
+  }
+
+
+  progress =
+    Math.max(
+      0,
+      Math.min(
+        100,
+        progress
+      )
+    );
+
+
+  fill.style.width =
+    progress + "%";
+
+
+  msg.textContent =
+    data.message ||
+    "Processando...";
+
 }
-</script>
 
-</body>
-</html>
+
+function renderResults(clips) {
+
+  if (!Array.isArray(clips)) {
+
+    results.innerHTML = `
+      <div class="result-empty">
+        Os cortes foram processados,
+        mas nenhum arquivo foi retornado.
+      </div>
+    `;
+
+    return;
+  }
+
+
+  if (clips.length === 0) {
+
+    results.innerHTML = `
+      <div class="result-empty">
+        Nenhum corte foi encontrado.
+      </
