@@ -1,5 +1,6 @@
 <!doctype html>
 <html lang="pt-BR">
+
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -13,9 +14,13 @@
 
 <main>
 
-  <div class="brand">✂️ CORTES IA</div>
+  <div class="brand">
+    ✂️ CORTES IA
+  </div>
 
-  <h1>Live inteira → Cortes prontos</h1>
+  <h1>
+    Live inteira → Cortes prontos
+  </h1>
 
   <p class="sub">
     A IA transcreve a live, encontra os melhores momentos
@@ -91,10 +96,7 @@
     </div>
 
 
-    <button
-      id="go"
-      type="button"
-    >
+    <button id="go" type="button">
       🚀 GERAR CORTES COM IA
     </button>
 
@@ -122,7 +124,8 @@
 
 
   <small>
-    Use somente conteúdo que você tenha autorização para baixar e editar.
+    Use somente conteúdo que você tenha autorização
+    para baixar e editar.
   </small>
 
 </main>
@@ -131,10 +134,6 @@
 <script>
 
 "use strict";
-
-
-let timer = null;
-let polling = false;
 
 
 const urlInput =
@@ -162,6 +161,14 @@ const results =
   document.getElementById("results");
 
 
+let timer = null;
+
+let processing = false;
+
+
+console.log("Cortes IA carregado");
+
+
 goButton.addEventListener(
   "click",
   start
@@ -170,7 +177,10 @@ goButton.addEventListener(
 
 async function start() {
 
-  if (polling) {
+  console.log("Botão clicado");
+
+
+  if (processing) {
     return;
   }
 
@@ -178,8 +188,10 @@ async function start() {
   const url =
     urlInput.value.trim();
 
+
   const clipCount =
     Number(countInput.value);
+
 
   const duration =
     Number(durationInput.value);
@@ -187,9 +199,10 @@ async function start() {
 
   if (!url) {
 
-    showError(
-      "Cole o link da live do YouTube."
-    );
+    statusBox.classList.remove("hide");
+
+    msg.textContent =
+      "❌ Cole o link da live do YouTube.";
 
     urlInput.focus();
 
@@ -197,49 +210,27 @@ async function start() {
   }
 
 
-  if (!isValidYoutubeUrl(url)) {
-
-    showError(
-      "Digite um link válido do YouTube."
-    );
-
-    urlInput.focus();
-
-    return;
-  }
-
-
-  if (
-    !Number.isInteger(clipCount) ||
-    clipCount < 1
-  ) {
-
-    showError(
-      "Quantidade de cortes inválida."
-    );
-
-    return;
-  }
-
-
-  polling = true;
+  processing = true;
 
   goButton.disabled = true;
+
 
   statusBox.classList.remove("hide");
 
   results.innerHTML = "";
 
-  fill.style.width = "3%";
+  fill.style.width = "5%";
 
   msg.textContent =
-    "Iniciando processamento...";
-
-
-  stopTimer();
+    "⏳ Conectando ao servidor...";
 
 
   try {
+
+    console.log(
+      "Enviando processamento..."
+    );
+
 
     const response =
       await fetch(
@@ -261,218 +252,23 @@ async function start() {
       );
 
 
-    const data =
-      await readJson(response);
+    const text =
+      await response.text();
 
 
-    if (!response.ok) {
-
-      throw new Error(
-        data.error ||
-        data.message ||
-        "Não foi possível iniciar o processamento."
-      );
-
-    }
-
-
-    if (!data.job_id) {
-
-      throw new Error(
-        "O servidor não retornou o ID do processamento."
-      );
-
-    }
-
-
-    msg.textContent =
-      "Processamento iniciado...";
-
-
-    await poll(data.job_id);
-
-
-    timer =
-      setInterval(
-        () => poll(data.job_id),
-        2000
-      );
-
-
-  } catch (error) {
-
-    console.error(
-      "Erro ao iniciar:",
-      error
+    console.log(
+      "Resposta:",
+      response.status,
+      text
     );
 
 
-    showError(
-      error.message ||
-      "Erro ao iniciar o processamento."
-    );
+    let data;
 
 
-    finish();
+    try {
 
+      data =
+        JSON.parse(text);
 
-  }
-
-}
-
-
-async function poll(id) {
-
-  if (!id || !polling) {
-    return;
-  }
-
-
-  try {
-
-    const response =
-      await fetch(
-        "/api/status/" +
-        encodeURIComponent(id),
-        {
-          cache: "no-store"
-        }
-      );
-
-
-    const data =
-      await readJson(response);
-
-
-    if (!response.ok) {
-
-      throw new Error(
-        data.error ||
-        data.message ||
-        "Erro ao consultar o processamento."
-      );
-
-    }
-
-
-    updateProgress(data);
-
-
-    if (
-      data.status === "concluido" ||
-      data.status === "completed"
-    ) {
-
-      finish();
-
-      fill.style.width =
-        "100%";
-
-      msg.textContent =
-        "✅ Cortes prontos!";
-
-
-      renderResults(
-        data.clips
-      );
-
-
-      return;
-    }
-
-
-    if (
-      data.status === "erro" ||
-      data.status === "error" ||
-      data.status === "failed"
-    ) {
-
-      finish();
-
-      msg.textContent =
-        data.message ||
-        data.error ||
-        "Ocorreu um erro durante o processamento.";
-
-      return;
-    }
-
-
-  } catch (error) {
-
-    console.error(
-      "Erro no processamento:",
-      error
-    );
-
-
-    stopTimer();
-
-
-    msg.textContent =
-      error.message ||
-      "Erro ao consultar o servidor.";
-
-
-    goButton.disabled = false;
-
-    polling = false;
-
-  }
-
-}
-
-
-function updateProgress(data) {
-
-  let progress =
-    Number(data.progress);
-
-
-  if (!Number.isFinite(progress)) {
-    progress = 0;
-  }
-
-
-  progress =
-    Math.max(
-      0,
-      Math.min(
-        100,
-        progress
-      )
-    );
-
-
-  fill.style.width =
-    progress + "%";
-
-
-  msg.textContent =
-    data.message ||
-    "Processando...";
-
-}
-
-
-function renderResults(clips) {
-
-  if (!Array.isArray(clips)) {
-
-    results.innerHTML = `
-      <div class="result-empty">
-        Os cortes foram processados,
-        mas nenhum arquivo foi retornado.
-      </div>
-    `;
-
-    return;
-  }
-
-
-  if (clips.length === 0) {
-
-    results.innerHTML = `
-      <div class="result-empty">
-        Nenhum corte foi encontrado.
-      </
+   
