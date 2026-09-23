@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: cortes-ia
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: TRANSCRIBE_MODEL
+        value: "gpt-4o-mini-transcribe"
+      - key: ANALYSIS_MODEL
+        value: "gpt-5.6-luna"
+      - key: OPENAI_API_KEY
+        sync: false

@@ -1,0 +1,27 @@
+<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cortes IA</title><link rel="stylesheet" href="/static/style.css"></head><body>
+<main><div class="brand">✂️ CORTES IA</div><h1>Live inteira → cortes prontos</h1>
+<p class="sub">A IA transcreve, encontra os melhores momentos, legenda e transforma em 9:16.</p>
+<section class="card">
+<label>Link da live do YouTube</label><input id="url" placeholder="Cole aqui o link da live...">
+<div class="grid"><div><label>Quantidade de cortes</label><select id="count"><option>3</option><option selected>5</option><option>10</option><option>15</option></select></div>
+<div><label>Duração máxima</label><select id="duration"><option value="30">30s</option><option value="60" selected>60s</option><option value="90">90s</option><option value="120">120s</option></select></div></div>
+<button id="go" onclick="start()">🚀 GERAR CORTES COM IA</button>
+<div id="status" class="hide"><div class="bar"><i id="fill"></i></div><b id="msg"></b><div id="results"></div></div>
+</section><small>Use somente conteúdo que você tenha autorização para baixar e editar.</small></main>
+<script>
+let t;
+async function start(){
+ let u=url.value.trim(); if(!u)return alert("Cole o link da live.");
+ go.disabled=true; status.classList.remove("hide"); results.innerHTML="";
+ let r=await fetch("/api/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:u,count:+count.value,duration:+duration.value})});
+ let d=await r.json(); if(!r.ok){alert(d.error);go.disabled=false;return}
+ t=setInterval(()=>poll(d.job_id),1500);
+}
+async function poll(id){
+ let d=await (await fetch("/api/status/"+id)).json(); fill.style.width=(d.progress||0)+"%";msg.textContent=d.message||"";
+ if(d.status==="concluido"){clearInterval(t);go.disabled=false;
+ results.innerHTML=d.clips.map((c,i)=>`<article><b>${c.title}</b><p>${c.hook||""}</p><a href="${c.file}">⬇ Baixar corte ${i+1}</a></article>`).join("");
+ } if(d.status==="erro"){clearInterval(t);go.disabled=false}
+}
+</script></body></html>
