@@ -1,12 +1,11 @@
 import os
-import uuid
 import json
+import uuid
 import threading
 import subprocess
-import re
 from pathlib import Path
 
-from flask import Flask, render_template, request, jsonify, send_from_directory
+from flask import Flask, jsonify, render_template, request, send_from_directory
 from openai import OpenAI
 
 
@@ -14,214 +13,345 @@ from openai import OpenAI
 # CONFIGURAÇÃO
 # ============================================================
 
-BASE = Path(__file__).resolve().parent
-JOBS = BASE / "jobs"
-JOBS.mkdir(parents=True, exist_ok=True)
+BASE_DIR = Path(__file__).resolve().parent
+WORK_DIR = Path(os.getenv("WORK_DIR", BASE_DIR / "work"))
+
+JOBS_DIR = WORK_DIR / "jobs"
+OUTPUT_DIR = WORK_DIR / "outputs"
+UPLOAD_DIR = WORK_DIR / "uploads"
+
+for directory in (JOBS_DIR, OUTPUT_DIR, UPLOAD_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
+
+
+PORT = int(os.getenv("PORT", "10000"))
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+TRANSCRIPTION_MODEL = os.getenv(
+    "TRANSCRIPTION_MODEL",
+    "gpt-4o-mini-transcribe"
+)
+
+ANALYSIS_MODEL = os.getenv(
+    "ANALYSIS_MODEL",
+    "gpt-5.6"
+)
+
+
+# ============================================================
+# FLASK
+# ============================================================
 
 app = Flask(__name__)
 
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024
+
 
 # ============================================================
-# UTILIDADES
+# OPENAI
 # ============================================================
 
-def save(job, state):
-    job.mkdir(parents=True, exist_ok=True)
+client = None
 
-    temp = job / "state.tmp"
-    target = job / "state.json"
-
-    temp.write_text(
-        json.dumps(state, ensure_ascii=False),
-        encoding="utf-8"
-    )
-
-    temp.replace(target)
+if OPENAI_API_KEY:
+    client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-def cmd(command):
-    """
-    Executa um comando externo e mostra o resultado completo
-    nos logs do Render.
-    """
+# ============================================================
+# JOBS
+# ============================================================
 
-    command = [str(x) for x in command]
+JOBS = {}
+JOBS_LOCK = threading.Lock()
 
-    print(
-        "\n==================================================",
-        flush=True
-    )
-    print(
-        "EXECUTANDO:",
-        " ".join(command),
-        flush=True
-    )
-    print(
-        "==================================================",
-        flush=True
-    )
 
-    result = subprocess.run(
+def create_job():
+    job_id = uuid.uuid4().hex
+
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "message": "Aguardando processamento...",
+            "clips": [],
+            "error": None,
+        }
+
+    return job_id
+
+
+def update_job(job_id, **kwargs):
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id].update(kwargs)
+
+
+def get_job(job_id):
+    with JOBS_LOCK:
+        if job_id not in JOBS:
+            return None
+
+        return dict(JOBS[job_id])
+
+
+# ============================================================
+# COMANDOS
+# ============================================================
+
+def run_command(command, timeout=3600):
+    process = subprocess.run(
         command,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
         text=True,
-        encoding="utf-8",
-        errors="replace"
+        timeout=timeout,
     )
 
-    output = result.stdout or ""
+    if process.returncode != 0:
+        error = process.stderr.strip()
 
-    print(output, flush=True)
+        if not error:
+            error = "O comando terminou com erro."
 
-    if result.returncode != 0:
-        raise RuntimeError(
-            "Comando falhou (exit %s):\n%s"
-            % (
-                result.returncode,
-                output[-12000:]
+        raise RuntimeError(error[-5000:])
+
+    return process.stdout
+
+
+# ============================================================
+# YT-DLP
+# ============================================================
+
+def download_video(url, output_path):
+
+    update_job(
+        CURRENT_JOB,
+        progress=5,
+        message="Baixando vídeo..."
+    )
+
+    command = [
+        "yt-dlp",
+        "--no-playlist",
+        "--merge-output-format",
+        "mp4",
+        "-f",
+        "bv*+ba/b",
+        "-o",
+        str(output_path),
+        url,
+    ]
+
+    run_command(command, timeout=7200)
+
+    if not output_path.exists():
+
+        candidates = list(
+            output_path.parent.glob("*")
+        )
+
+        videos = [
+            file for file in candidates
+            if file.suffix.lower() in {
+                ".mp4",
+                ".mkv",
+                ".webm",
+                ".mov"
+            }
+        ]
+
+        if not videos:
+            raise RuntimeError(
+                "O yt-dlp terminou, mas nenhum vídeo foi encontrado."
             )
+
+        videos.sort(
+            key=lambda file: file.stat().st_mtime,
+            reverse=True
         )
 
-    return output
+        videos[0].rename(output_path)
 
 
-def clean_json_text(text):
-    """
-    Remove possíveis blocos ```json ... ``` retornados pela IA.
-    """
+# ============================================================
+# FFMPEG
+# ============================================================
 
-    text = (text or "").strip()
+def get_duration(video):
 
-    if text.startswith("```"):
-        text = re.sub(
-            r"^```(?:json)?\s*",
-            "",
-            text,
-            flags=re.IGNORECASE
-        )
+    result = run_command([
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(video),
+    ])
 
-        text = re.sub(
-            r"\s*```$",
-            "",
-            text
-        )
-
-    return text.strip()
+    return float(result.strip())
 
 
-def clamp_number(value, minimum, maximum, default):
-    try:
-        value = int(value)
-    except (TypeError, ValueError):
-        value = default
+def extract_audio(video, audio):
 
-    return max(minimum, min(value, maximum))
+    update_job(
+        CURRENT_JOB,
+        progress=20,
+        message="Extraindo áudio..."
+    )
+
+    run_command([
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "mp3",
+        "-b:a",
+        "64k",
+        str(audio),
+    ], timeout=7200)
 
 
 # ============================================================
 # TRANSCRIÇÃO
 # ============================================================
 
-def transcribe(client, audio):
-    print("Iniciando transcrição...", flush=True)
+def transcribe_audio(audio):
 
-    with open(audio, "rb") as f:
+    if client is None:
+        raise RuntimeError(
+            "OPENAI_API_KEY não configurada."
+        )
+
+    update_job(
+        CURRENT_JOB,
+        progress=35,
+        message="Transcrevendo áudio com IA..."
+    )
+
+    with open(audio, "rb") as file:
+
         response = client.audio.transcriptions.create(
-            model=os.getenv(
-                "TRANSCRIBE_MODEL",
-                "gpt-4o-mini-transcribe"
-            ),
-            file=f,
+            model=TRANSCRIPTION_MODEL,
+            file=file,
             response_format="verbose_json",
-            timestamp_granularities=["segment"]
         )
 
     segments = []
 
-    for segment in getattr(response, "segments", []) or []:
-        start = float(getattr(segment, "start", 0) or 0)
-        end = float(getattr(segment, "end", 0) or 0)
-        text = str(getattr(segment, "text", "") or "").strip()
+    raw_segments = getattr(
+        response,
+        "segments",
+        None
+    )
 
-        if not text:
-            continue
+    if raw_segments:
 
-        if end <= start:
-            continue
+        for segment in raw_segments:
 
-        segments.append({
-            "start": start,
-            "end": end,
-            "text": text
-        })
+            if isinstance(segment, dict):
+
+                start = float(segment.get("start", 0))
+                end = float(segment.get("end", start))
+                text = str(segment.get("text", "")).strip()
+
+            else:
+
+                start = float(getattr(segment, "start", 0))
+                end = float(
+                    getattr(segment, "end", start)
+                )
+                text = str(
+                    getattr(segment, "text", "")
+                ).strip()
+
+            if text:
+
+                segments.append({
+                    "start": start,
+                    "end": end,
+                    "text": text,
+                })
 
     if not segments:
-        raise RuntimeError(
-            "A transcrição não retornou segmentos com timestamps."
+
+        text = getattr(
+            response,
+            "text",
+            ""
         )
 
-    print(
-        f"Transcrição concluída: {len(segments)} segmentos.",
-        flush=True
-    )
+        if text:
+
+            segments.append({
+                "start": 0,
+                "end": 999999,
+                "text": text.strip(),
+            })
 
     return segments
 
 
 # ============================================================
-# ESCOLHA DOS MELHORES MOMENTOS
+# ESCOLHA DOS CORTES
 # ============================================================
 
-def choose_moments(client, segments, count, duration):
+def analyze_best_clips(segments, duration, clip_count):
+
+    if not segments:
+        return fallback_clips(
+            duration,
+            clip_count
+        )
 
     transcript = "\n".join(
-        f"[{x['start']:.1f}-{x['end']:.1f}] {x['text']}"
-        for x in segments
+        f"[{segment['start']:.2f}-{segment['end']:.2f}] "
+        f"{segment['text']}"
+        for segment in segments
     )
 
-    # Evita mandar uma quantidade gigantesca de texto para a API.
-    transcript = transcript[:180000]
-
     prompt = f"""
-Você é um editor profissional de vídeos curtos para
-YouTube Shorts, Instagram Reels e TikTok.
+Você é um editor profissional de vídeos curtos.
 
-Analise a transcrição abaixo e escolha até {count} dos
-melhores momentos.
+Analise a transcrição abaixo e escolha os melhores momentos
+para vídeos curtos.
+
+Duração total do vídeo:
+{duration:.2f} segundos
+
+Quantidade desejada:
+{clip_count}
+
+Escolha momentos que tenham potencial de prender atenção,
+como histórias interessantes, opiniões fortes, explicações,
+frases marcantes, humor, surpresa ou informações úteis.
 
 REGRAS:
 
-- Cada corte deve ter entre 30 e {duration} segundos.
-- Não invente nenhuma fala.
-- Use somente trechos existentes na transcrição.
-- O início e o final devem ser naturais.
-- Priorize:
-  - gancho forte;
-  - opinião interessante;
-  - história;
-  - surpresa;
-  - pergunta e resposta;
-  - momento engraçado;
-  - informação útil;
-  - discussão;
-  - frase que desperte curiosidade.
-- Evite trechos sem contexto.
-- Evite silêncio.
-- Evite escolher várias partes praticamente iguais.
-- Os timestamps precisam estar dentro da transcrição.
+- Não invente timestamps.
+- Use somente timestamps existentes na transcrição.
+- Cada corte deve ter entre 30 e 90 segundos quando possível.
+- Evite cortes muito parecidos.
+- Evite começar no meio de uma frase.
+- Evite terminar no meio de uma frase.
 
-RETORNE SOMENTE JSON VÁLIDO.
-
-Formato obrigatório:
+Retorne SOMENTE JSON válido neste formato:
 
 {{
   "clips": [
     {{
-      "start": 100.0,
-      "end": 155.0,
-      "title": "Título curto do corte",
-      "hook": "Gancho curto para apresentar o corte"
+      "start": 120.5,
+      "end": 178.2,
+      "title": "Título curto"
     }}
   ]
 }}
@@ -231,199 +361,560 @@ TRANSCRIÇÃO:
 {transcript}
 """
 
-    model = os.getenv(
-        "ANALYSIS_MODEL",
-        "gpt-5.6"
-    )
-
-    print(
-        f"Analisando transcrição com modelo: {model}",
-        flush=True
-    )
-
     response = client.responses.create(
-        model=model,
-        input=prompt
+        model=ANALYSIS_MODEL,
+        input=prompt,
     )
 
-    text = clean_json_text(
-        getattr(response, "output_text", "")
-    )
+    text = response.output_text.strip()
 
-    if not text:
-        raise RuntimeError(
-            "A IA não retornou nenhum resultado."
-        )
-
-    # Procura o primeiro objeto JSON.
-    match = re.search(
-        r"\{.*\}",
-        text,
-        flags=re.DOTALL
-    )
-
-    if not match:
-        raise RuntimeError(
-            "A IA não retornou JSON válido.\n"
-            + text[:4000]
-        )
+    text = text.replace(
+        "```json",
+        ""
+    ).replace(
+        "```",
+        ""
+    ).strip()
 
     try:
-        data = json.loads(match.group(0))
-    except json.JSONDecodeError as e:
-        raise RuntimeError(
-            "Não foi possível interpretar o JSON da IA: "
-            + str(e)
+        data = json.loads(text)
+
+    except json.JSONDecodeError:
+
+        return fallback_clips(
+            duration,
+            clip_count
         )
 
-    clips = data.get("clips", [])
+    clips = []
 
-    if not isinstance(clips, list):
-        raise RuntimeError(
-            "A IA retornou um formato de clips inválido."
-        )
-
-    valid_clips = []
-
-    video_duration = 0
-
-    if segments:
-        video_duration = max(
-            float(s["end"])
-            for s in segments
-        )
-
-    for clip in clips:
+    for item in data.get("clips", []):
 
         try:
-            start = float(clip["start"])
-            end = float(clip["end"])
-        except (KeyError, TypeError, ValueError):
+
+            start = float(item["start"])
+            end = float(item["end"])
+
+            start = max(
+                0,
+                min(start, duration)
+            )
+
+            end = max(
+                start + 1,
+                min(end, duration)
+            )
+
+            if end > start:
+
+                clips.append({
+                    "start": start,
+                    "end": end,
+                    "title": str(
+                        item.get(
+                            "title",
+                            f"Corte {len(clips) + 1}"
+                        )
+                    ),
+                })
+
+        except Exception:
             continue
 
-        if start < 0:
-            start = 0
+    if not clips:
 
-        if end <= start:
-            continue
-
-        if video_duration > 0:
-            start = min(start, video_duration)
-            end = min(end, video_duration)
-
-        length = end - start
-
-        if length < 30:
-            continue
-
-        if length > duration:
-            end = start + duration
-
-        if end <= start:
-            continue
-
-        valid_clips.append({
-            "start": start,
-            "end": end,
-            "title": str(
-                clip.get("title") or "Corte"
-            )[:150],
-            "hook": str(
-                clip.get("hook") or ""
-            )[:300]
-        })
-
-        if len(valid_clips) >= count:
-            break
-
-    if not valid_clips:
-        raise RuntimeError(
-            "A IA não encontrou cortes válidos "
-            "dentro dos limites solicitados."
+        return fallback_clips(
+            duration,
+            clip_count
         )
 
-    print(
-        f"Cortes selecionados: {len(valid_clips)}",
-        flush=True
+    return clips[:clip_count]
+
+
+def fallback_clips(duration, count):
+
+    clips = []
+
+    if duration <= 30:
+        return [{
+            "start": 0,
+            "end": duration,
+            "title": "Corte"
+        }]
+
+    clip_duration = min(
+        60,
+        duration
     )
 
-    return valid_clips
+    available = max(
+        0,
+        duration - clip_duration
+    )
+
+    if count <= 1:
+        positions = [available / 2]
+
+    else:
+
+        positions = [
+            available * i / (count - 1)
+            for i in range(count)
+        ]
+
+    for index, start in enumerate(
+        positions,
+        start=1
+    ):
+
+        clips.append({
+            "start": round(start, 2),
+            "end": round(
+                min(
+                    start + clip_duration,
+                    duration
+                ),
+                2
+            ),
+            "title": f"Corte {index}",
+        })
+
+    return clips
 
 
 # ============================================================
-# SRT / LEGENDAS
+# CRIAÇÃO DO VÍDEO
 # ============================================================
 
-def make_srt(segments, start, end, path):
+def create_clip(
+    source,
+    destination,
+    start,
+    end
+):
 
-    rows = []
-    number = 1
+    duration = max(
+        1,
+        end - start
+    )
 
-    def timestamp(seconds):
-        seconds = max(0, float(seconds))
+    video_filter = (
+        "scale=720:1280:"
+        "force_original_aspect_ratio=increase,"
+        "crop=720:1280"
+    )
 
-        total_ms = int(round(seconds * 1000))
+    run_command([
+        "ffmpeg",
+        "-y",
+        "-ss",
+        str(start),
+        "-i",
+        str(source),
+        "-t",
+        str(duration),
+        "-vf",
+        video_filter,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        str(destination),
+    ], timeout=7200)
 
-        hours = total_ms // 3_600_000
-        total_ms %= 3_600_000
 
-        minutes = total_ms // 60_000
-        total_ms %= 60_000
+# ============================================================
+# SRT
+# ============================================================
 
-        secs = total_ms // 1000
-        milliseconds = total_ms % 1000
+def seconds_to_srt(seconds):
 
-        return (
-            f"{hours:02d}:"
-            f"{minutes:02d}:"
-            f"{secs:02d},"
-            f"{milliseconds:03d}"
+    seconds = max(
+        0,
+        float(seconds)
+    )
+
+    milliseconds = int(
+        round(
+            (seconds - int(seconds)) * 1000
         )
+    )
+
+    total = int(seconds)
+
+    hours = total // 3600
+
+    total %= 3600
+
+    minutes = total // 60
+
+    seconds = total % 60
+
+    return (
+        f"{hours:02d}:"
+        f"{minutes:02d}:"
+        f"{seconds:02d},"
+        f"{milliseconds:03d}"
+    )
+
+
+def create_srt(
+    segments,
+    clip_start,
+    clip_end,
+    output
+):
+
+    lines = []
+
+    counter = 1
 
     for segment in segments:
 
-        seg_start = max(
-            float(segment["start"]),
-            start
+        start = max(
+            segment["start"],
+            clip_start
         )
 
-        seg_end = min(
-            float(segment["end"]),
-            end
+        end = min(
+            segment["end"],
+            clip_end
         )
 
-        if seg_end <= seg_start:
+        if end <= start:
             continue
 
-        text = str(
-            segment.get("text", "")
-        ).strip()
+        local_start = start - clip_start
+        local_end = end - clip_start
 
-        if not text:
-            continue
-
-        rows.append(
-            f"{number}\n"
-            f"{timestamp(seg_start - start)} --> "
-            f"{timestamp(seg_end - start)}\n"
-            f"{text}\n"
+        lines.append(
+            f"{counter}\n"
+            f"{seconds_to_srt(local_start)} --> "
+            f"{seconds_to_srt(local_end)}\n"
+            f"{segment['text']}\n"
         )
 
-        number += 1
+        counter += 1
 
-    path.write_text(
-        "\n".join(rows),
+    output.write_text(
+        "\n".join(lines),
         encoding="utf-8"
     )
 
 
 # ============================================================
-# PROCESSAMENTO PRINCIPAL
+# PROCESSAMENTO
 # ============================================================
 
-def worker(jobid, url, count, duration):
+CURRENT_JOB = None
 
-    job = JOBS / jobid
-    job.mkdir(parents=True, exist_ok=True)
 
-    state =
+def process_job(
+    job_id,
+    url,
+    clip_count
+):
+
+    global CURRENT_JOB
+
+    CURRENT_JOB = job_id
+
+    job_dir = JOBS_DIR / job_id
+    output_dir = OUTPUT_DIR / job_id
+
+    job_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    video = job_dir / "source.mp4"
+    audio = job_dir / "audio.mp3"
+
+    try:
+
+        update_job(
+            job_id,
+            status="processing",
+            progress=1,
+            message="Iniciando..."
+        )
+
+        download_video(
+            url,
+            video
+        )
+
+        update_job(
+            job_id,
+            progress=15,
+            message="Verificando vídeo..."
+        )
+
+        duration = get_duration(video)
+
+        extract_audio(
+            video,
+            audio
+        )
+
+        segments = transcribe_audio(
+            audio
+        )
+
+        update_job(
+            job_id,
+            progress=50,
+            message="Encontrando os melhores momentos..."
+        )
+
+        clips = analyze_best_clips(
+            segments,
+            duration,
+            clip_count
+        )
+
+        result = []
+
+        total = len(clips)
+
+        for index, clip in enumerate(
+            clips,
+            start=1
+        ):
+
+            output_video = (
+                output_dir /
+                f"corte_{index:02d}.mp4"
+            )
+
+            output_srt = (
+                output_dir /
+                f"corte_{index:02d}.srt"
+            )
+
+            create_clip(
+                video,
+                output_video,
+                clip["start"],
+                clip["end"]
+            )
+
+            create_srt(
+                segments,
+                clip["start"],
+                clip["end"],
+                output_srt
+            )
+
+            progress = (
+                50 +
+                int(
+                    (index / total) * 45
+                )
+            )
+
+            update_job(
+                job_id,
+                progress=progress,
+                message=(
+                    f"Gerando corte "
+                    f"{index}/{total}..."
+                )
+            )
+
+            result.append({
+                "index": index,
+                "title": clip["title"],
+                "start": clip["start"],
+                "end": clip["end"],
+                "video": (
+                    f"/media/{job_id}/"
+                    f"corte_{index:02d}.mp4"
+                ),
+                "subtitle": (
+                    f"/media/{job_id}/"
+                    f"corte_{index:02d}.srt"
+                ),
+            })
+
+        update_job(
+            job_id,
+            status="completed",
+            progress=100,
+            message="Cortes prontos!",
+            clips=result,
+        )
+
+    except Exception as error:
+
+        update_job(
+            job_id,
+            status="error",
+            progress=100,
+            message="Erro durante o processamento.",
+            error=str(error),
+        )
+
+
+# ============================================================
+# ROTAS
+# ============================================================
+
+@app.get("/")
+def home():
+
+    return render_template(
+        "index.html"
+    )
+
+
+@app.get("/health")
+def health():
+
+    return jsonify({
+        "status": "ok"
+    })
+
+
+@app.post("/api/start")
+def start():
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    url = str(
+        data.get(
+            "url",
+            ""
+        )
+    ).strip()
+
+    if not url:
+
+        return jsonify({
+            "error": "Informe o link do vídeo."
+        }), 400
+
+    if not url.startswith(
+        ("http://", "https://")
+    ):
+
+        return jsonify({
+            "error": "Informe uma URL válida."
+        }), 400
+
+    try:
+
+        clip_count = int(
+            data.get(
+                "clip_count",
+                5
+            )
+        )
+
+    except Exception:
+
+        clip_count = 5
+
+    clip_count = max(
+        1,
+        min(
+            clip_count,
+            20
+        )
+    )
+
+    job_id = create_job()
+
+    thread = threading.Thread(
+        target=process_job,
+        args=(
+            job_id,
+            url,
+            clip_count,
+        ),
+        daemon=True,
+    )
+
+    thread.start()
+
+    return jsonify({
+        "success": True,
+        "job_id": job_id,
+    })
+
+
+@app.get("/api/status/<job_id>")
+def status(job_id):
+
+    job = get_job(job_id)
+
+    if job is None:
+
+        return jsonify({
+            "error": "Processamento não encontrado."
+        }), 404
+
+    return jsonify(job)
+
+
+@app.get("/media/<job_id>/<path:filename>")
+def media(
+    job_id,
+    filename
+):
+
+    directory = OUTPUT_DIR / job_id
+
+    return send_from_directory(
+        directory,
+        filename,
+        as_attachment=False
+    )
+
+
+# ============================================================
+# ERROS
+# ============================================================
+
+@app.errorhandler(413)
+def too_large(error):
+
+    return jsonify({
+        "error": "O arquivo enviado é muito grande."
+    }), 413
+
+
+@app.errorhandler(500)
+def server_error(error):
+
+    return jsonify({
+        "error": "Erro interno do servidor."
+    }), 500
+
+
+# ============================================================
+# EXECUÇÃO LOCAL
+# ============================================================
+
+if __name__ == "__main__":
+
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        debug=False
+    )
